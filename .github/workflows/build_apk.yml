@@ -21,18 +21,19 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        # Flet sẽ tự động đọc file này để biết cần cài yt-dlp
         pip install -r requirements.txt
 
     - name: Setup Flutter
       uses: subosito/flutter-action@v2
       with:
-        flutter-version: '3.19.0'
+        # [QUAN TRỌNG] Đã nâng cấp lên bản 3.24.3 để khớp với yêu cầu của Flet
+        # Sửa lỗi Flet dừng lại hỏi "Proceed? [y/n]" gây crash
+        flutter-version: '3.24.3'
+        channel: 'stable'
 
     - name: Build APK with Flet
       run: |
-        # [QUAN TRỌNG] Đã xóa cờ lỗi --include-packages
-        # Chỉ giữ lại --verbose để xem log
+        # Chạy build
         flet build apk --verbose
 
     - name: Upload APK Artifact
