@@ -21,20 +21,27 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
+        # Cài thêm cookiecutter để hỗ trợ Flet đóng gói tốt hơn
+        pip install cookiecutter
         pip install -r requirements.txt
+
+    - name: Setup Java (Bắt buộc cho Android Build)
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'temurin'
+        java-version: '17'
 
     - name: Setup Flutter
       uses: subosito/flutter-action@v2
       with:
-        # [QUAN TRỌNG] Đã nâng cấp lên bản 3.24.3 để khớp với yêu cầu của Flet
-        # Sửa lỗi Flet dừng lại hỏi "Proceed? [y/n]" gây crash
         flutter-version: '3.24.3'
         channel: 'stable'
 
-    - name: Build APK with Flet
+    - name: Build APK with Flet (FORCE YES)
       run: |
-        # Chạy build
-        flet build apk --verbose
+        # Dùng lệnh 'yes' để tự động bấm 'y' khi Flet hỏi cài đặt
+        # Dấu '|' sẽ chuyền chữ 'y' vào mồm Flet để nó im lặng làm việc
+        yes | flet build apk --verbose
 
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
