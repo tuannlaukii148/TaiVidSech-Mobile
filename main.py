@@ -12,7 +12,7 @@ import unicodedata
 from datetime import datetime
 
 # --- CẤU HÌNH ---
-VERSION = "v8.1 Enterprise (Final Stable)"
+VERSION = "v8.2 Enterprise (Final Auto-Fix)"
 COLOR_PRIMARY = "#d32f2f"
 COLOR_BG = "#121212"
 HISTORY_KEY = "hust_history_v1"
@@ -32,20 +32,23 @@ def safe_put(q, item):
             pass
 
 def slugify_and_truncate(name: str, max_length: int = 100):
-    """Cắt ngắn và làm sạch tên file để tránh lỗi Android"""
+    """Làm sạch tên file để tránh lỗi hệ thống Android"""
     if not name: return "file"
+    # Chuẩn hóa Unicode
     name = unicodedata.normalize("NFKD", name)
+    # Loại bỏ ký tự đặc biệt, chỉ giữ lại chữ, số, gạch ngang, chấm
     name = re.sub(r'[^\w\s\.-]', '', name).strip()
     name = re.sub(r'\s+', ' ', name)
+    
     if len(name) <= max_length: return name
     
+    # Cắt ngắn nhưng giữ đuôi file
     parts = os.path.splitext(name)
-    # Giữ lại đuôi file
     base = parts[0][: max_length - len(parts[1]) - 1]
     return base + parts[1]
 
 def safe_rename_downloaded_file(filepath: str, max_title_len: int = 80):
-    """Đổi tên file sau khi tải để đảm bảo an toàn"""
+    """Đổi tên file sau khi tải về để đảm bảo an toàn"""
     try:
         if not filepath or not os.path.exists(filepath): return filepath
         folder, fname = os.path.split(filepath)
@@ -63,7 +66,7 @@ def safe_rename_downloaded_file(filepath: str, max_title_len: int = 80):
             
         new_path = os.path.join(folder, new_name)
         
-        # Tránh ghi đè file cũ
+        # Tránh ghi đè file cũ (thêm số _1, _2...)
         i = 1
         candidate = new_path
         while os.path.exists(candidate) and candidate != filepath:
@@ -86,11 +89,11 @@ def main(page: ft.Page):
     page.bgcolor = COLOR_BG
     page.padding = 10
     
-    # [QUAN TRỌNG] Giữ màn hình sáng để không bị ngắt tải (Fix lỗi Sleep Mode)
+    # [QUAN TRỌNG] Giữ màn hình luôn sáng để Android không giết App khi đang tải
     page.platform = ft.PagePlatform.ANDROID
     page.keep_screen_on = True 
 
-    # Responsive
+    # Responsive Width
     try:
         win_w = page.window_width or 800
     except:
@@ -101,7 +104,7 @@ def main(page: ft.Page):
     progress_queue = queue.Queue(maxsize=2000)
     cancel_event = threading.Event()
     
-    # Load Settings & History
+    # Load Data
     default_settings = {"smart_clipboard": True, "cookies": "", "theme_color": "red"}
     raw_settings = page.client_storage.get(SETTINGS_KEY)
     user_settings = raw_settings if isinstance(raw_settings, dict) else default_settings
@@ -109,58 +112,18 @@ def main(page: ft.Page):
     raw_history = page.client_storage.get(HISTORY_KEY)
     download_history = raw_history if isinstance(raw_history, list) else []
 
-    # --- UI COMPONENTS ---
-    
-    txt_url = ft.TextField(label="Dán Link Video...", prefix_icon=ft.icons.LINK, bgcolor="#1e1e1e", border_radius=10, width=ctrl_width)
-    
-    # Tự động tìm đường dẫn lưu
-    def detect_default_path():
-        candidates = [
-            "/storage/emulated/0/Download", 
-            "/storage/emulated/0/Downloads",
-            "/storage/emulated/0/DCIM", 
-            os.path.join(os.path.expanduser("~"), "Download"), 
-            "." 
-        ]
-        for p in candidates:
-            if os.path.exists(p): return p
-        return "."
-    
-    txt_save_path = ft.TextField(label="Thư mục lưu", value=detect_default_path(), width=ctrl_width, text_size=12)
-    
-    dd_quality = ft.Dropdown(
-        label="Chọn chất lượng", options=[], visible=False, 
-        prefix_icon=ft.icons.VIDEO_SETTINGS, bgcolor="#1e1e1e", 
-        border_radius=10, width=ctrl_width
-    )
-    
-    sw_playlist = ft.Switch(label="Tải toàn bộ Playlist", value=False, visible=False)
-    lbl_info = ft.Text("", color="grey", size=12)
-    prg_bar = ft.ProgressBar(width=ctrl_width, color="orange", bgcolor="#333333", visible=False, value=0)
-    lbl_status = ft.Text("Sẵn sàng", size=14, color="green", text_align="center")
-    
-    # Log Window
-    log_field = ft.TextField(label="Nhật ký (Logs)", multiline=True, read_only=True, expand=True, height=150, value="", text_size=10, bgcolor="black", color="#00FF00")
-
-    btn_analyze = ft.ElevatedButton("PHÂN TÍCH LINK", icon=ft.icons.ANALYTICS, bgcolor="blue", color="white", width=180)
-    btn_download = ft.ElevatedButton("TẢI XUỐNG", icon=ft.icons.DOWNLOAD, bgcolor="green", color="white", width=180, visible=False)
-    btn_cancel = ft.ElevatedButton("HỦY", icon=ft.icons.CANCEL, bgcolor="red", color="white", visible=False, disabled=True)
-    
-    txt_cookies = ft.TextField(label="Cookies (Netscape format)", multiline=True, min_lines=3, max_lines=5, hint_text="Dán nội dung cookies.txt", text_size=12, value=user_settings.get("cookies", ""))
-    sw_smart_clip = ft.Switch(label="Tự động bắt Link", value=user_settings.get("smart_clipboard", True))
-    btn_save_settings = ft.ElevatedButton("LƯU CÀI ĐẶT", icon=ft.icons.SAVE, bgcolor=COLOR_PRIMARY, color="white")
-
     # --- HELPERS ---
     def add_log(msg: str):
-        # Không update page ở đây để tránh lag, chỉ cập nhật biến value
         now = datetime.now().strftime("%H:%M:%S")
         new = f"{now} | {msg}\n"
+        # Giới hạn log tránh tràn RAM
         log_field.value = (new + log_field.value)[:10000]
 
     def prepare_save_path(path: str):
         try:
             if not path: path = "."
             os.makedirs(path, exist_ok=True)
+            # Test quyền ghi
             testfile = os.path.join(path, ".hust_write_test")
             with open(testfile, "w") as f: f.write("ok")
             os.remove(testfile)
@@ -176,12 +139,43 @@ def main(page: ft.Page):
         page.client_storage.set(HISTORY_KEY, download_history)
         update_history_tab()
 
+    def detect_default_path():
+        candidates = [
+            "/storage/emulated/0/Download", 
+            "/storage/emulated/0/Downloads",
+            "/storage/emulated/0/DCIM", 
+            os.path.join(os.path.expanduser("~"), "Download"), 
+            "." 
+        ]
+        for p in candidates:
+            if os.path.exists(p): return p
+        return "."
+
+    # --- UI COMPONENTS ---
+    txt_url = ft.TextField(label="Dán Link Video...", prefix_icon=ft.icons.LINK, bgcolor="#1e1e1e", border_radius=10, width=ctrl_width)
+    txt_save_path = ft.TextField(label="Thư mục lưu", value=detect_default_path(), width=ctrl_width, text_size=12)
+    
+    dd_quality = ft.Dropdown(label="Chọn chất lượng", options=[], visible=False, prefix_icon=ft.icons.VIDEO_SETTINGS, bgcolor="#1e1e1e", border_radius=10, width=ctrl_width)
+    sw_playlist = ft.Switch(label="Tải toàn bộ Playlist", value=False, visible=False)
+    lbl_info = ft.Text("", color="grey", size=12)
+    prg_bar = ft.ProgressBar(width=ctrl_width, color="orange", bgcolor="#333333", visible=False, value=0)
+    lbl_status = ft.Text("Sẵn sàng", size=14, color="green", text_align="center")
+    log_field = ft.TextField(label="Nhật ký (Logs)", multiline=True, read_only=True, expand=True, height=150, value="", text_size=10, bgcolor="black", color="#00FF00")
+
+    btn_analyze = ft.ElevatedButton("PHÂN TÍCH LINK", icon=ft.icons.ANALYTICS, bgcolor="blue", color="white", width=180)
+    btn_download = ft.ElevatedButton("TẢI XUỐNG", icon=ft.icons.DOWNLOAD, bgcolor="green", color="white", width=180, visible=False)
+    btn_cancel = ft.ElevatedButton("HỦY", icon=ft.icons.CANCEL, bgcolor="red", color="white", visible=False, disabled=True)
+    
+    txt_cookies = ft.TextField(label="Cookies (Netscape format)", multiline=True, min_lines=3, max_lines=5, hint_text="Dán nội dung cookies.txt", text_size=12, value=user_settings.get("cookies", ""))
+    sw_smart_clip = ft.Switch(label="Tự động bắt Link", value=user_settings.get("smart_clipboard", True))
+    btn_save_settings = ft.ElevatedButton("LƯU CÀI ĐẶT", icon=ft.icons.SAVE, bgcolor=COLOR_PRIMARY, color="white")
+
     # --- WORKERS (LOGIC) ---
 
     def run_analyze(url, q):
         try:
             import yt_dlp
-            # Kiểm tra FFmpeg (Fix lỗi video câm)
+            # Kiểm tra FFmpeg để lọc video câm
             has_ffmpeg = shutil.which("ffmpeg") is not None
             
             opts = {
@@ -195,11 +189,10 @@ def main(page: ft.Page):
                 is_playlist = False
                 if isinstance(info, dict) and 'entries' in info:
                     is_playlist = True
-                    # Lấy video con đầu tiên để phân tích format
                     try:
                         first = info['entries'][0]
-                        sub_url = first.get('url') or first.get('id')
-                        info = ydl.extract_info(sub_url, download=False)
+                        sub = first.get('url') or first.get('id')
+                        info = ydl.extract_info(sub, download=False)
                     except: pass 
                 
                 formats = info.get('formats', [])
@@ -217,10 +210,11 @@ def main(page: ft.Page):
                     acodec = f.get('acodec') # Codec âm thanh
                     
                     if h and ext in ['mp4', 'webm'] and h >= 144:
-                        # [FIX QUAN TRỌNG] Nếu không có FFmpeg VÀ video không tiếng -> Bỏ qua
+                        # [FIX QUAN TRỌNG] Nếu không có FFmpeg VÀ video này không có tiếng (acodec='none') -> BỎ QUA
+                        # Để tránh người dùng tải về file chỉ có hình
                         if not has_ffmpeg and acodec == 'none':
                             continue
-                            
+
                         if h not in seen:
                             seen.add(h)
                             note = ""
@@ -259,7 +253,7 @@ def main(page: ft.Page):
             has_ffmpeg = shutil.which("ffmpeg") is not None
             if not has_ffmpeg: safe_put(q, {'type': 'log', 'msg': 'Không có FFmpeg -> Chế độ tương thích.'})
 
-            # [FIX] Tên file an toàn + Cấu hình mạng trâu bò
+            # [FIX] Tên file ngắn + Mạng trâu bò (Retries)
             outtmpl = os.path.join(save_path, "%(title).50s-%(id)s.%(ext)s")
             
             opts = {
@@ -269,7 +263,10 @@ def main(page: ft.Page):
                 'progress_hooks': [progress_hook],
                 'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'},
                 'noplaylist': not bool(is_playlist),
-                'socket_timeout': 30, 'retries': 10, 'fragment_retries': 10 # [FIX] Mạng lag
+                # [FIX QUAN TRỌNG] Tự động thử lại khi rớt mạng
+                'socket_timeout': 30, 
+                'retries': 10, 
+                'fragment_retries': 10
             }
             if cookie_file: opts['cookiefile'] = cookie_file
 
@@ -290,7 +287,7 @@ def main(page: ft.Page):
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
                 
-                # [FIX] Đổi tên file an toàn sau khi tải
+                # [FIX] Đổi tên file an toàn sau khi tải xong
                 final_path = last_filepath
                 if last_filepath:
                     final_path = safe_rename_downloaded_file(last_filepath)
