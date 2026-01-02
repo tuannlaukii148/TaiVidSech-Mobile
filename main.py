@@ -2,321 +2,534 @@ import flet as ft
 import os
 import threading
 import time
-import json
+import queue
+import tempfile
+import shutil
+import sys
+import traceback
+import re
+import unicodedata
+from datetime import datetime
 
-# --- CẤU HÌNH & HẰNG SỐ ---
-VERSION = "v3.0 Ultimate"
-# Màu chủ đạo (HUST Style)
-COLOR_PRIMARY = "#d32f2f"  # Đỏ đậm
-COLOR_SECONDARY = "#ffa000" # Cam vàng
-COLOR_BG = "#121212"       # Đen Dark Mode
+# --- CẤU HÌNH ---
+VERSION = "v8.1 Enterprise (Final Stable)"
+COLOR_PRIMARY = "#d32f2f"
+COLOR_BG = "#121212"
+HISTORY_KEY = "hust_history_v1"
+SETTINGS_KEY = "hust_settings_v1"
+
+# --- HELPER FUNCTIONS ---
+
+def safe_put(q, item):
+    """Đẩy dữ liệu vào queue an toàn, tránh tràn bộ nhớ"""
+    try:
+        q.put_nowait(item)
+    except queue.Full:
+        try:
+            q.get_nowait()
+            q.put_nowait(item)
+        except:
+            pass
+
+def slugify_and_truncate(name: str, max_length: int = 100):
+    """Cắt ngắn và làm sạch tên file để tránh lỗi Android"""
+    if not name: return "file"
+    name = unicodedata.normalize("NFKD", name)
+    name = re.sub(r'[^\w\s\.-]', '', name).strip()
+    name = re.sub(r'\s+', ' ', name)
+    if len(name) <= max_length: return name
+    
+    parts = os.path.splitext(name)
+    # Giữ lại đuôi file
+    base = parts[0][: max_length - len(parts[1]) - 1]
+    return base + parts[1]
+
+def safe_rename_downloaded_file(filepath: str, max_title_len: int = 80):
+    """Đổi tên file sau khi tải để đảm bảo an toàn"""
+    try:
+        if not filepath or not os.path.exists(filepath): return filepath
+        folder, fname = os.path.split(filepath)
+        title, ext = os.path.splitext(fname)
+        
+        # Thử tách phần ID phía sau (thường yt-dlp thêm ID vào cuối)
+        parts = title.rsplit('-', 1)
+        if len(parts) == 2 and len(parts[1]) <= 20 and all(c.isalnum() for c in parts[1]):
+            base, idpart = parts
+            new_base = slugify_and_truncate(base, max_length=max_title_len)
+            new_name = f"{new_base}-{idpart}{ext}"
+        else:
+            new_base = slugify_and_truncate(title, max_length=max_title_len)
+            new_name = f"{new_base}{ext}"
+            
+        new_path = os.path.join(folder, new_name)
+        
+        # Tránh ghi đè file cũ
+        i = 1
+        candidate = new_path
+        while os.path.exists(candidate) and candidate != filepath:
+            candidate = os.path.join(folder, f"{os.path.splitext(new_name)[0]}_{i}{ext}")
+            i += 1
+            
+        if candidate != filepath:
+            os.rename(filepath, candidate)
+            return candidate
+        return filepath
+    except:
+        return filepath
+
+# --- MAIN APP ---
 
 def main(page: ft.Page):
-    # 1. CẤU HÌNH PAGE (GIAO DIỆN CHUYÊN NGHIỆP)
+    # 1. CẤU HÌNH PAGE
     page.title = "HUST Downloader Ultimate"
     page.theme_mode = ft.ThemeMode.DARK
     page.bgcolor = COLOR_BG
-    page.padding = 0  # Full màn hình
-    page.scroll = ft.ScrollMode.ADAPTIVE
+    page.padding = 10
     
-    # Font chữ hệ thống đẹp hơn
-    page.fonts = {
-        "Roboto": "https://github.com/google/fonts/raw/main/apache/roboto/Roboto-Regular.ttf"
-    }
-    page.theme = ft.Theme(font_family="Roboto")
+    # [QUAN TRỌNG] Giữ màn hình sáng để không bị ngắt tải (Fix lỗi Sleep Mode)
+    page.platform = ft.PagePlatform.ANDROID
+    page.keep_screen_on = True 
 
-    # --- STATE MANAGEMENT (LƯU CẤU HÌNH) ---
-    def load_settings():
-        try:
-            return page.client_storage.get("user_settings") or {"mode": "video", "thumb": False, "sub": False}
-        except:
-            return {"mode": "video", "thumb": False, "sub": False}
+    # Responsive
+    try:
+        win_w = page.window_width or 800
+    except:
+        win_w = 800
+    ctrl_width = min(760, max(360, int(win_w * 0.9)))
 
-    def save_settings():
-        settings = {
-            "mode": opt_mode.value,
-            "thumb": chk_thumb.value,
-            "sub": chk_sub.value
-        }
-        page.client_storage.set("user_settings", settings)
-
-    user_prefs = load_settings()
-
-    # --- UI COMPONENTS (THÀNH PHẦN GIAO DIỆN) ---
-
-    # Header Gradient sang trọng
-    header = ft.Container(
-        content=ft.Column([
-            ft.Row([
-                ft.Icon(ft.icons.ROCKET_LAUNCH_ROUNDED, size=40, color="white"),
-                ft.Column([
-                    ft.Text("HUST DOWNLOADER", size=20, weight="bold", color="white"),
-                    ft.Text(f"{VERSION} • No-FFmpeg Engine", size=12, color="white70")
-                ], spacing=0)
-            ], alignment=ft.MainAxisAlignment.CENTER),
-        ], alignment=ft.MainAxisAlignment.CENTER),
-        padding=ft.padding.only(top=50, bottom=20),
-        gradient=ft.LinearGradient(
-            begin=ft.alignment.top_left,
-            end=ft.alignment.bottom_right,
-            colors=[COLOR_PRIMARY, "#b71c1c"],
-        ),
-        border_radius=ft.border_radius.only(bottom_left=30, bottom_right=30)
-    )
-
-    # Input URL
-    txt_url = ft.TextField(
-        label="Dán liên kết Video vào đây",
-        hint_text="Hỗ trợ: Youtube, TikTok, Facebook...",
-        prefix_icon=ft.icons.LINK,
-        border_radius=15,
-        text_size=14,
-        bgcolor="#1e1e1e",
-        border_color=COLOR_PRIMARY
-    )
-
-    # Nút Paste Clipboard
-    def paste_link(e):
-        # Lưu ý: Trên Android đôi khi cần quyền, nhưng Flet xử lý khá tốt
-        txt_url.value = page.get_clipboard()
-        txt_url.update()
-        
-    btn_paste = ft.IconButton(ft.icons.PASTE, on_click=paste_link, tooltip="Dán Link")
-    txt_url.suffix = btn_paste
-
-    # Tùy chọn (Tabs Selection)
-    opt_mode = ft.RadioGroup(
-        content=ft.Row([
-            ft.Radio(value="video", label="Video (MP4)"),
-            ft.Radio(value="audio", label="Nhạc (M4A/MP3)"),
-        ], alignment=ft.MainAxisAlignment.CENTER),
-        value=user_prefs["mode"]
-    )
-
-    # Tùy chọn mở rộng (Checkbox)
-    chk_thumb = ft.Checkbox(label="Tải Ảnh bìa (Thumbnail)", value=user_prefs["thumb"])
-    chk_sub = ft.Checkbox(label="Tải Phụ đề (Subtitle)", value=user_prefs["sub"])
-
-    # Progress Bar (Thanh tiến trình 7 màu)
-    prg_bar = ft.ProgressBar(width=400, color=COLOR_SECONDARY, bgcolor="#333333", visible=False)
-    lbl_status = ft.Text("Sẵn sàng tải xuống", size=14, color="grey", text_align=ft.TextAlign.CENTER)
+    # State Management
+    progress_queue = queue.Queue(maxsize=2000)
+    cancel_event = threading.Event()
     
-    # Log Console (Nhìn cho giống Hacker/Chuyên nghiệp)
-    txt_log = ft.Container(
-        content=ft.Column([], scroll=ft.ScrollMode.ALWAYS),
-        height=100,
-        bgcolor="black",
-        border_radius=10,
-        padding=10,
-        visible=False
+    # Load Settings & History
+    default_settings = {"smart_clipboard": True, "cookies": "", "theme_color": "red"}
+    raw_settings = page.client_storage.get(SETTINGS_KEY)
+    user_settings = raw_settings if isinstance(raw_settings, dict) else default_settings
+    
+    raw_history = page.client_storage.get(HISTORY_KEY)
+    download_history = raw_history if isinstance(raw_history, list) else []
+
+    # --- UI COMPONENTS ---
+    
+    txt_url = ft.TextField(label="Dán Link Video...", prefix_icon=ft.icons.LINK, bgcolor="#1e1e1e", border_radius=10, width=ctrl_width)
+    
+    # Tự động tìm đường dẫn lưu
+    def detect_default_path():
+        candidates = [
+            "/storage/emulated/0/Download", 
+            "/storage/emulated/0/Downloads",
+            "/storage/emulated/0/DCIM", 
+            os.path.join(os.path.expanduser("~"), "Download"), 
+            "." 
+        ]
+        for p in candidates:
+            if os.path.exists(p): return p
+        return "."
+    
+    txt_save_path = ft.TextField(label="Thư mục lưu", value=detect_default_path(), width=ctrl_width, text_size=12)
+    
+    dd_quality = ft.Dropdown(
+        label="Chọn chất lượng", options=[], visible=False, 
+        prefix_icon=ft.icons.VIDEO_SETTINGS, bgcolor="#1e1e1e", 
+        border_radius=10, width=ctrl_width
     )
+    
+    sw_playlist = ft.Switch(label="Tải toàn bộ Playlist", value=False, visible=False)
+    lbl_info = ft.Text("", color="grey", size=12)
+    prg_bar = ft.ProgressBar(width=ctrl_width, color="orange", bgcolor="#333333", visible=False, value=0)
+    lbl_status = ft.Text("Sẵn sàng", size=14, color="green", text_align="center")
+    
+    # Log Window
+    log_field = ft.TextField(label="Nhật ký (Logs)", multiline=True, read_only=True, expand=True, height=150, value="", text_size=10, bgcolor="black", color="#00FF00")
 
-    def log(msg, color="green"):
-        """Hàm ghi log vào màn hình"""
-        txt_log.content.controls.append(ft.Text(f"> {msg}", color=color, size=12, font_family="Consolas"))
-        txt_log.visible = True
-        txt_log.update()
+    btn_analyze = ft.ElevatedButton("PHÂN TÍCH LINK", icon=ft.icons.ANALYTICS, bgcolor="blue", color="white", width=180)
+    btn_download = ft.ElevatedButton("TẢI XUỐNG", icon=ft.icons.DOWNLOAD, bgcolor="green", color="white", width=180, visible=False)
+    btn_cancel = ft.ElevatedButton("HỦY", icon=ft.icons.CANCEL, bgcolor="red", color="white", visible=False, disabled=True)
+    
+    txt_cookies = ft.TextField(label="Cookies (Netscape format)", multiline=True, min_lines=3, max_lines=5, hint_text="Dán nội dung cookies.txt", text_size=12, value=user_settings.get("cookies", ""))
+    sw_smart_clip = ft.Switch(label="Tự động bắt Link", value=user_settings.get("smart_clipboard", True))
+    btn_save_settings = ft.ElevatedButton("LƯU CÀI ĐẶT", icon=ft.icons.SAVE, bgcolor=COLOR_PRIMARY, color="white")
 
-    # --- LOGIC CORE (TRÁI TIM CỦA APP) ---
-    def run_download_process(url, mode, want_thumb, want_sub):
+    # --- HELPERS ---
+    def add_log(msg: str):
+        # Không update page ở đây để tránh lag, chỉ cập nhật biến value
+        now = datetime.now().strftime("%H:%M:%S")
+        new = f"{now} | {msg}\n"
+        log_field.value = (new + log_field.value)[:10000]
+
+    def prepare_save_path(path: str):
         try:
-            # 1. Lazy Import (Chống đen màn hình)
+            if not path: path = "."
+            os.makedirs(path, exist_ok=True)
+            testfile = os.path.join(path, ".hust_write_test")
+            with open(testfile, "w") as f: f.write("ok")
+            os.remove(testfile)
+            return True, path
+        except Exception as ex:
+            return False, str(ex)
+
+    def save_history(item):
+        nonlocal download_history
+        if not isinstance(item, dict): return
+        download_history.insert(0, item)
+        download_history = download_history[:50]
+        page.client_storage.set(HISTORY_KEY, download_history)
+        update_history_tab()
+
+    # --- WORKERS (LOGIC) ---
+
+    def run_analyze(url, q):
+        try:
             import yt_dlp
+            # Kiểm tra FFmpeg (Fix lỗi video câm)
+            has_ffmpeg = shutil.which("ffmpeg") is not None
             
-            # 2. Xác định đường dẫn lưu trữ (Quan trọng nhất trên Android)
-            # Ưu tiên thư mục Download công khai
-            save_path = "/storage/emulated/0/Download/HUST_Downloads"
-            
-            # Tạo thư mục nếu chưa có
-            if not os.path.exists(save_path):
-                try:
-                    os.makedirs(save_path, exist_ok=True)
-                except:
-                    # Fallback: Nếu không tạo được ở Download, dùng thư mục App Data
-                    save_path = "." 
-
-            # 3. Cấu hình yt-dlp tối ưu cho Mobile (Deep Config)
-            # Template tên file an toàn
-            path_template = f'{save_path}/%(title)s [%(id)s].%(ext)s'
-
             opts = {
-                'outtmpl': path_template,
-                'quiet': True,
-                'no_warnings': True,
-                'nocheckcertificate': True,
-                'ignoreerrors': True,
-                
-                # [FIX LỖI] Tên file ký tự lạ gây crash Android
-                'restrictfilenames': True,
-                
-                # [FIX LỖI] Tránh bị chặn bởi Youtube/Tiktok
-                'http_headers': {
-                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                },
-
-                # Hook tiến trình
-                'progress_hooks': [lambda d: update_progress(d)],
+                'quiet': True, 'no_warnings': True, 'extract_flat': True,
+                'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
             }
-
-            # [LOGIC] Xử lý định dạng
-            if mode == 'audio':
-                # Ưu tiên m4a (AAC) vì Android chơi tốt hơn webm
-                opts['format'] = 'bestaudio[ext=m4a]/bestaudio/best'
-            else:
-                # Video: Ưu tiên mp4 để tương thích thư viện ảnh
-                opts['format'] = 'best[ext=mp4]/best'
-
-            # [LOGIC] Tùy chọn thêm
-            if want_thumb:
-                opts['writethumbnail'] = True
-            if want_sub:
-                opts['writesubtitles'] = True
-                opts['subtitleslangs'] = ['vi', 'en', 'all']
-
-            # Bắt đầu tải
-            lbl_status.value = "Đang kết nối máy chủ..."
-            page.update()
-            log("Đang khởi tạo yt-dlp engine...", "yellow")
-
+            
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                title = info.get('title', 'Unknown File')
+                info = ydl.extract_info(url, download=False)
                 
-                lbl_status.value = "✅ HOÀN TẤT!"
-                lbl_status.color = "green"
-                log(f"Đã lưu: {title}", "cyan")
-                log(f"Vị trí: {save_path}", "white")
+                is_playlist = False
+                if isinstance(info, dict) and 'entries' in info:
+                    is_playlist = True
+                    # Lấy video con đầu tiên để phân tích format
+                    try:
+                        first = info['entries'][0]
+                        sub_url = first.get('url') or first.get('id')
+                        info = ydl.extract_info(sub_url, download=False)
+                    except: pass 
                 
-                # Hiện thông báo nổi (Snackbar)
-                page.show_snack_bar(ft.SnackBar(
-                    content=ft.Text(f"Tải xong: {title}", color="white"),
-                    bgcolor="green"
-                ))
-
-        except ImportError:
-            lbl_status.value = "Lỗi cài đặt!"
-            lbl_status.color = "red"
-            log("Thiếu thư viện yt-dlp!", "red")
-        except PermissionError:
-            lbl_status.value = "Lỗi Quyền!"
-            lbl_status.color = "red"
-            log("Chưa cấp quyền truy cập bộ nhớ!", "red")
-            page.show_snack_bar(ft.SnackBar(content=ft.Text("Hãy cấp quyền Bộ nhớ cho App!"), bgcolor="red"))
+                formats = info.get('formats', [])
+                formats = [f for f in formats if isinstance(f, dict)]
+                formats.sort(key=lambda x: x.get('height') or 0, reverse=True)
+                
+                options = []
+                options.append({"key": "audio", "text": "🎵 Audio M4A (Nhạc)"})
+                seen = set()
+                
+                for f in formats:
+                    fid = f.get('format_id')
+                    h = f.get('height')
+                    ext = f.get('ext')
+                    acodec = f.get('acodec') # Codec âm thanh
+                    
+                    if h and ext in ['mp4', 'webm'] and h >= 144:
+                        # [FIX QUAN TRỌNG] Nếu không có FFmpeg VÀ video không tiếng -> Bỏ qua
+                        if not has_ffmpeg and acodec == 'none':
+                            continue
+                            
+                        if h not in seen:
+                            seen.add(h)
+                            note = ""
+                            if acodec == 'none': note = " (🔇 Không tiếng)"
+                            options.append({"key": fid, "text": f"🎬 Video {h}p ({ext}){note}"})
+                            
+                q.put({'type': 'analyze_done', 'options': options, 'title': info.get('title', 'Unknown'), 'is_playlist': is_playlist})
         except Exception as e:
-            lbl_status.value = "Lỗi không xác định"
-            lbl_status.color = "red"
-            log(f"Error: {str(e)}", "red")
+            safe_put(q, {'type': 'error', 'msg': f"Lỗi phân tích: {e}"})
+
+    def run_download(url, quality_id, is_playlist, save_path, cookie_content, cancel_evt, q):
+        cookie_file = None
+        last_filepath = None
+        try:
+            import yt_dlp
+            from yt_dlp.utils import DownloadError
+            
+            ok, msg = prepare_save_path(save_path)
+            if not ok:
+                safe_put(q, {'type': 'error', 'msg': f"Lỗi thư mục: {msg}"})
+                return
+
+            if cookie_content and cookie_content.strip():
+                tf = tempfile.NamedTemporaryFile(mode="w", delete=False, prefix="hust_", suffix=".txt")
+                tf.write(cookie_content)
+                tf.flush(); tf.close()
+                cookie_file = tf.name
+
+            def progress_hook(d):
+                nonlocal last_filepath
+                if cancel_evt.is_set(): raise DownloadError("HUST_CANCELLED")
+                if d.get('status') == 'finished':
+                    last_filepath = d.get('filename')
+                safe_put(q, {'type': 'progress', 'd': d})
+
+            has_ffmpeg = shutil.which("ffmpeg") is not None
+            if not has_ffmpeg: safe_put(q, {'type': 'log', 'msg': 'Không có FFmpeg -> Chế độ tương thích.'})
+
+            # [FIX] Tên file an toàn + Cấu hình mạng trâu bò
+            outtmpl = os.path.join(save_path, "%(title).50s-%(id)s.%(ext)s")
+            
+            opts = {
+                'outtmpl': outtmpl,
+                'quiet': True, 'no_warnings': True, 'nocheckcertificate': True,
+                'restrictfilenames': True,
+                'progress_hooks': [progress_hook],
+                'http_headers': {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'},
+                'noplaylist': not bool(is_playlist),
+                'socket_timeout': 30, 'retries': 10, 'fragment_retries': 10 # [FIX] Mạng lag
+            }
+            if cookie_file: opts['cookiefile'] = cookie_file
+
+            media_type = 'video'
+            if quality_id == "audio":
+                opts['format'] = 'bestaudio[ext=m4a]/bestaudio/best'
+                media_type = 'audio'
+            elif quality_id:
+                if has_ffmpeg:
+                    opts['format'] = f"{quality_id}+bestaudio/best"
+                else:
+                    opts['format'] = f"{quality_id}/best[ext=mp4]/best"
+            else:
+                opts['format'] = "best[ext=mp4]/best"
+
+            safe_put(q, {'type': 'status', 'msg': 'Đang kết nối Server...'})
+            
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+                
+                # [FIX] Đổi tên file an toàn sau khi tải
+                final_path = last_filepath
+                if last_filepath:
+                    final_path = safe_rename_downloaded_file(last_filepath)
+                
+                safe_put(q, {'type': 'finished', 'title': os.path.basename(final_path) if final_path else 'Done', 'filepath': final_path, 'media_type': media_type})
+
+        except Exception as e:
+            text = str(e)
+            if 'HUST_CANCELLED' in text or 'Cancelled' in text:
+                safe_put(q, {'type': 'cancelled'})
+            else:
+                safe_put(q, {'type': 'error', 'msg': text})
         finally:
-            # Reset UI
-            btn_action.disabled = False
-            btn_action.text = "BẮT ĐẦU TẢI NGAY"
-            prg_bar.visible = False
-            page.update()
+            if cookie_file and os.path.exists(cookie_file):
+                try: os.remove(cookie_file)
+                except: pass
+            safe_put(q, {'type': 'worker_done'})
 
-    # Hàm cập nhật progress bar an toàn (tránh lỗi NaN)
-    def update_progress(d):
-        if d['status'] == 'downloading':
-            try:
-                p = d.get('_percent_str', '0%').replace('%', '')
-                val = float(p) / 100
-                prg_bar.value = val
-                lbl_status.value = f"Đang tải: {d.get('_percent_str')} | {d.get('_speed_str')}"
-                page.update()
-            except: pass
-        elif d['status'] == 'finished':
-            prg_bar.value = 1.0
-            lbl_status.value = "Đang xử lý file..."
-            page.update()
+    # --- UI EVENT HANDLERS ---
 
-    # Sự kiện nút bấm
-    def btn_click(e):
-        url = txt_url.value
+    def analyze_click(e):
+        url = txt_url.value.strip()
         if not url:
-            txt_url.error_text = "Bạn chưa nhập Link!"
-            txt_url.update()
+            lbl_status.value = "Chưa nhập Link!"; lbl_status.color = "red"; page.update()
             return
-        
-        txt_url.error_text = None
-        
-        # Lưu cấu hình người dùng
-        save_settings()
+        btn_analyze.disabled = True
+        lbl_status.value = "Đang phân tích..."; lbl_status.color = "yellow"
+        prg_bar.visible = True; prg_bar.value = None
+        dd_quality.visible = False; btn_download.visible = False; sw_playlist.visible = False
+        page.update()
+        threading.Thread(target=run_analyze, args=(url, progress_queue), daemon=True).start()
 
-        # UI Updates
-        btn_action.disabled = True
-        btn_action.text = "ĐANG XỬ LÝ..."
-        prg_bar.visible = True
-        prg_bar.value = None # Loading vô định ban đầu
-        txt_log.content.controls.clear() # Xóa log cũ
+    def download_click(e):
+        url = txt_url.value.strip()
+        quality_id = dd_quality.value
+        is_playlist = sw_playlist.value
+        save_path = txt_save_path.value.strip() or "."
+        
+        ok, msg = prepare_save_path(save_path)
+        if not ok:
+            add_log(f"Lỗi Path: {msg}")
+            lbl_status.value = "Thư mục lỗi"; lbl_status.color = "red"; page.update()
+            return
+
+        btn_download.visible = False; btn_analyze.visible = False
+        btn_cancel.visible = True; btn_cancel.disabled = False
+        dd_quality.disabled = True
+        lbl_status.value = "Đang khởi động..."; prg_bar.visible = True; prg_bar.value = 0
+        page.update()
+        
+        cancel_event.clear()
+        threading.Thread(target=run_download, args=(url, quality_id, is_playlist, save_path, txt_cookies.value, cancel_event, progress_queue), daemon=True).start()
+
+    def cancel_click_handler(e):
+        if not cancel_event.is_set():
+            cancel_event.set()
+            lbl_status.value = "Đang dừng..."; page.update()
+
+    btn_analyze.on_click = analyze_click
+    btn_download.on_click = download_click
+    btn_cancel.on_click = cancel_click_handler
+    
+    # Paste Button
+    def paste_click(e):
+        try: txt_url.value = page.get_clipboard() or ""; txt_url.update()
+        except: pass
+    txt_url.suffix = ft.IconButton(ft.icons.PASTE, on_click=paste_click)
+
+    # Save Settings
+    def save_settings_click(e):
+        new_settings = {"cookies": txt_cookies.value, "smart_clipboard": sw_smart_clip.value, "theme_color": "red"}
+        page.client_storage.set(SETTINGS_KEY, new_settings)
+        page.show_snack_bar(ft.SnackBar(content=ft.Text("Đã lưu cài đặt!"), bgcolor="green"))
+    btn_save_settings.on_click = save_settings_click
+
+    # --- TABS & LAYOUT ---
+
+    # History List
+    lv_history = ft.ListView(expand=True, spacing=10)
+    def update_history_tab():
+        lv_history.controls.clear()
+        if not download_history:
+            lv_history.controls.append(ft.Text("Chưa có lịch sử", italic=True, text_align="center"))
+        else:
+            for item in download_history:
+                icon = ft.icons.MUSIC_NOTE if item.get('type') == 'audio' else ft.icons.VIDEO_FILE
+                lv_history.controls.append(
+                    ft.Container(
+                        content=ft.Row([
+                            ft.Icon(icon, color="orange"),
+                            ft.Column([
+                                ft.Text(item.get('title',''), weight="bold", no_wrap=True, max_lines=1, width=200),
+                                ft.Text(f"{item.get('date')} | {item.get('path')}", size=10, color="grey")
+                            ], spacing=2),
+                            ft.Icon(ft.icons.CHECK_CIRCLE, color="green", size=16)
+                        ], alignment=ft.MainAxisAlignment.SPACE_BETWEEN),
+                        bgcolor="#1e1e1e", padding=10, border_radius=10
+                    )
+                )
         page.update()
 
-        # Chạy đa luồng
-        threading.Thread(
-            target=run_download_process,
-            args=(url, opt_mode.value, chk_thumb.value, chk_sub.value),
-            daemon=True
-        ).start()
-
-    # Nút Hành động (Big Button)
-    btn_action = ft.ElevatedButton(
-        text="BẮT ĐẦU TẢI NGAY",
-        width=300,
-        height=55,
-        style=ft.ButtonStyle(
-            bgcolor=COLOR_PRIMARY,
-            color="white",
-            shape=ft.RoundedRectangleBorder(radius=15),
-            elevation=5,
-        ),
-        on_click=btn_click
-    )
-
-    # Info Footer
-    footer = ft.Container(
+    tab_home = ft.Container(
         content=ft.Column([
-            ft.Text("Files lưu tại: Bộ nhớ trong > Download > HUST_Downloads", size=10, color="grey"),
-            ft.Text("Developed by TuanNlauKii148", size=10, weight="bold", color="#555555"),
-        ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-        padding=20
-    )
-
-    # --- LAYOUT LẮP RÁP ---
-    container = ft.Container(
-        content=ft.Column([
-            header,
-            ft.Container(height=20),
-            
-            # Card điều khiển chính
-            ft.Container(
-                content=ft.Column([
-                    txt_url,
-                    ft.Divider(height=20, color="transparent"),
-                    
-                    ft.Text("Cấu hình tải:", weight="bold", size=16),
-                    opt_mode,
-                    ft.Row([chk_thumb, chk_sub], alignment=ft.MainAxisAlignment.CENTER),
-                    
-                    ft.Divider(height=20, color="transparent"),
-                    btn_action,
-                ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
-                padding=20,
-                bgcolor="#1e1e1e",
-                border_radius=20,
-                margin=ft.margin.symmetric(horizontal=15)
-            ),
-            
-            ft.Container(height=20),
-            lbl_status,
-            ft.Container(content=prg_bar, padding=ft.padding.symmetric(horizontal=40)),
+            ft.Icon(ft.icons.ROCKET_LAUNCH_ROUNDED, size=60, color=COLOR_PRIMARY),
+            ft.Text("HUST DOWNLOADER", size=24, weight="bold"),
+            ft.Text(VERSION, size=12, color="grey"),
             ft.Container(height=10),
-            
-            # Khu vực Log (Console)
-            ft.Container(content=txt_log, padding=ft.padding.symmetric(horizontal=15)),
-            
-            footer
+            txt_url,
+            ft.Container(height=5),
+            txt_save_path,
+            ft.Container(height=5),
+            lbl_info,
+            sw_playlist,
+            dd_quality,
+            ft.Container(height=10),
+            ft.Row([btn_analyze, btn_download, btn_cancel], alignment=ft.MainAxisAlignment.CENTER),
+            ft.Container(height=10),
+            lbl_status,
+            prg_bar,
+            ft.Container(height=10),
+            log_field
         ], horizontal_alignment=ft.CrossAxisAlignment.CENTER),
+        padding=10
     )
 
-    page.add(container)
+    tab_history = ft.Container(content=ft.Column([
+        ft.Text("Lịch sử", size=20, weight="bold"),
+        ft.ElevatedButton("Xóa lịch sử", icon=ft.icons.DELETE, on_click=lambda e: (download_history.clear(), page.client_storage.remove(HISTORY_KEY), update_history_tab()), bgcolor="red"),
+        ft.Divider(), lv_history
+    ]), padding=10)
+
+    tab_settings = ft.Container(content=ft.Column([
+        ft.Text("Cấu hình", size=20, weight="bold"),
+        ft.Container(height=10), sw_smart_clip, ft.Divider(),
+        ft.Text("Quản lý Cookie:", weight="bold"), txt_cookies,
+        ft.Container(height=20), btn_save_settings
+    ]), padding=10)
+
+    tabs = ft.Tabs(selected_index=0, animation_duration=300, tabs=[
+        ft.Tab(text="Tải xuống", icon=ft.icons.DOWNLOAD),
+        ft.Tab(text="Lịch sử", icon=ft.icons.HISTORY),
+        ft.Tab(text="Cài đặt", icon=ft.icons.SETTINGS)
+    ], expand=1)
+    
+    tabs.tabs[0].content = tab_home
+    tabs.tabs[1].content = tab_history
+    tabs.tabs[2].content = tab_settings
+    page.add(tabs)
+    update_history_tab()
+
+    # Smart Clipboard
+    if user_settings.get("smart_clipboard"):
+        try:
+            clip = page.get_clipboard()
+            if clip and "http" in clip and clip != txt_url.value:
+                txt_url.value = clip; page.show_snack_bar(ft.SnackBar(content=ft.Text("Đã bắt link!")))
+        except: pass
+
+    # --- QUEUE POLLING ---
+    last_percent = 0.0
+    last_ui_time = 0.0
+    
+    def poll_queue(evt):
+        nonlocal last_percent, last_ui_time
+        any_update = False
+        while not progress_queue.empty():
+            item = progress_queue.get_nowait()
+            t = item.get('type')
+            
+            if t == 'analyze_done':
+                opts = []
+                for opt in item.get('options', []):
+                    try: opts.append(ft.dropdown.Option(key=opt['key'], text=opt['text']))
+                    except: continue
+                dd_quality.options = opts
+                if opts: dd_quality.value = opts[0].key
+                
+                lbl_info.value = f"Tiêu đề: {item.get('title','')}"
+                if item.get('is_playlist'):
+                    sw_playlist.visible = True; sw_playlist.value = False
+                    lbl_info.value += " (Playlist)"
+                
+                dd_quality.visible = True; btn_download.visible = True
+                btn_analyze.disabled = False; prg_bar.visible = False
+                lbl_status.value = "Đã phân tích xong!"; lbl_status.color = "blue"
+                any_update = True
+                
+            elif t == 'progress':
+                d = item.get('d', {})
+                if d.get('status') == 'downloading':
+                    try:
+                        p = float(str(d.get('_percent_str', '0%')).replace('%','').strip())/100.0
+                    except: p = 0.0
+                    now = time.time()
+                    if abs(p - last_percent) >= 0.005 or (now - last_ui_time) > 0.2:
+                        last_percent = p; last_ui_time = now
+                        prg_bar.value = p
+                        lbl_status.value = f"Đang tải: {d.get('_percent_str')} | {d.get('_speed_str')}"
+                        any_update = True
+                        
+            elif t == 'finished':
+                lbl_status.value = "✅ HOÀN TẤT!"; lbl_status.color = "green"
+                prg_bar.value = 1
+                fname = item.get('filepath') or "file"
+                add_log(f"Xong: {fname}")
+                page.show_snack_bar(ft.SnackBar(content=ft.Text("Đã lưu thành công!"), bgcolor="green"))
+                save_history({
+                    "title": item.get('title', 'Unknown'),
+                    "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "path": fname,
+                    "type": item.get('media_type', 'video')
+                })
+                any_update = True
+                
+            elif t == 'cancelled':
+                lbl_status.value = "⛔ ĐÃ HỦY"; lbl_status.color = "grey"
+                add_log("User Cancelled")
+                any_update = True
+                
+            elif t == 'error':
+                msg = str(item.get('msg'))
+                lbl_status.value = "❌ Lỗi (Xem Log)"; lbl_status.color = "red"
+                add_log(f"ERR: {msg}")
+                any_update = True
+                
+            elif t == 'log':
+                add_log(item.get('msg'))
+                any_update = True
+                
+            elif t == 'worker_done':
+                btn_download.visible = True; btn_cancel.visible = False; btn_cancel.disabled = True
+                btn_analyze.visible = True; btn_analyze.disabled = False
+                dd_quality.disabled = False; prg_bar.visible = False
+                any_update = True
+
+        if any_update: page.update()
+
+    timer = ft.Timer(0.15, poll_queue)
+    timer.autostart = True
+    page.overlay.append(timer)
 
 ft.app(target=main)
